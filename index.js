@@ -29,6 +29,27 @@ app.post("/recordClientStatus", (req, res) => {
     res.status(200).json({}); 
 });
 
+app.post("//connectServer", (req, res) => {
+    const loginToken = req.body.loginToken;
+    const platform = req.body.platform;
+    const playerId = req.body.playerId;
+    const version = req.body.version;
+
+    console.log("Connection Request:", {
+        platform,
+        playerId,
+        version
+    });
+
+    res.status(200).json({
+        "error": 0,
+        "userId": playerId,
+        "aceId": "test",
+        "gateToken": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiYWRtaW4iOnRydWUsImlhdCI6MTUxNjIzOTAyMn0.KMUFsIDTnFmyG3nMiGM6H9FNFUROf3wh7SmqJp-QV30",
+        "endpoint": "127.0.0.1:6969",
+    });
+});
+
 app.post("/connectServer", (req, res) => {
     const loginToken = req.body.loginToken;
     const platform = req.body.platform;
@@ -46,7 +67,7 @@ app.post("/connectServer", (req, res) => {
         "userId": playerId,
         "aceId": "test",
         "gateToken": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiYWRtaW4iOnRydWUsImlhdCI6MTUxNjIzOTAyMn0.KMUFsIDTnFmyG3nMiGM6H9FNFUROf3wh7SmqJp-QV30",
-        "endpoint": "localhost:6969",
+        "endpoint": "127.0.0.1:6969",
     });
 });
 
@@ -152,8 +173,16 @@ const server = net.createServer((socket) => {
 
       let RequestWrapperType = Root.lookupType("ProjectBoundary.RequestWrapper");
 
-      let RequestWrapper = RequestWrapperType.decode(data.subarray(4));
+      let RequestWrapper;
       
+      try{
+        RequestWrapper = RequestWrapperType.decode(data.subarray(4));
+      }
+      catch(e){
+        
+      }
+      
+      if(RequestWrapper != undefined){
       let RequestObj = RequestWrapperType.toObject(RequestWrapper, ObjectOptions);
 
       const MessageId = RequestObj.MessageId;
@@ -467,6 +496,7 @@ const server = net.createServer((socket) => {
 
         //socket.write(data);
       }
+    }
     }
     
 
