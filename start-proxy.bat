@@ -1,10 +1,10 @@
 @echo off
 setlocal
-title Project Rebound MetaServer
+title Boundary Proxy + MetaServer
 cd /d "%~dp0"
 
 echo ========================================
-echo   Project Rebound MetaServer Launcher
+echo   Boundary TCP Proxy + MetaServer
 echo ========================================
 echo.
 
@@ -14,10 +14,6 @@ if %ERRORLEVEL% NEQ 0 (
     pause
     exit /b 1
 )
-
-echo Node.js version:
-node -v
-echo.
 
 if not exist "node_modules\" (
     echo [INFO] Installing dependencies...
@@ -30,25 +26,25 @@ if not exist "node_modules\" (
     echo.
 )
 
-echo [INFO] Checking port 6968...
-set "PID="
-for /f "tokens=5" %%a in ('netstat -ano ^| findstr /r /c:":6968 "') do set "PID=%%a"
-if not "%PID%"=="" (
-    echo [WARN] Port 6968 is in use by PID %PID%.
-    echo [INFO] Terminating PID %PID%...
-    taskkill /PID %PID% /F >nul 2>&1
-    timeout /t 2 >nul
-)
+echo [INFO] Starting MetaServer on port 6968 in a new window...
+start "Boundary-MetaServer" cmd /c "cd /d %~dp0 && node index.js"
+echo [INFO] Waiting for MetaServer to start...
+timeout /t 3 >nul
 
-echo [INFO] Starting MetaServer...
-echo   HTTP API:  http://127.0.0.1:8000
-echo   TCP Game:  127.0.0.1:6968
-echo   UDP QoS:   127.0.0.1:9000
+echo [INFO] Starting TCP Proxy on port 6969...
 echo.
-echo Press Ctrl+C to stop the server.
+echo   Game Client  --TCP-->  Proxy (:6969)  --TCP-->  MetaServer (:6968)
+echo.
+echo   HTTP API:  http://127.0.0.1:8000
+echo   TCP Proxy: 127.0.0.1:6969
+echo   UDP QoS:   127.0.0.1:9000
+echo   Logs:      %~dp0logs\
+echo.
+echo Press Ctrl+C to stop the proxy.
+echo (Close the MetaServer window separately when done.)
 echo ========================================
 echo.
 
-node index.js
+node proxy.js
 
 pause

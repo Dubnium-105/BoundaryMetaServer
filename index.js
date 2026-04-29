@@ -32,6 +32,9 @@ app.use((req, res, next) => {
 const MatchmakingHost = "204.12.195.98";
 const MatchmakingPort = 9000;
 
+// MatchServer management API base URL (HTTP API on port 9001)
+const MATCHSERVER_API = `http://${MatchmakingHost}:9001`;
+
 const matchmakingUDPServerDiscoveryPayload = {"servers":[{"location_id":6,"region_id":"336d1f3e-3ecb-11eb-a7dc-3b7705f20f56","ipv4":MatchmakingHost,"ipv6":"","port":MatchmakingPort}]}
 
 app.get("/", (req, res) => {
@@ -59,7 +62,7 @@ app.post("//connectServer", (req, res) => {
         "userId": playerId,
         "aceId": "test",
         "gateToken": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiYWRtaW4iOnRydWUsImlhdCI6MTUxNjIzOTAyMn0.KMUFsIDTnFmyG3nMiGM6H9FNFUROf3wh7SmqJp-QV30",
-        "endpoint": "204.12.195.98:6969",
+        "endpoint": "127.0.0.1:6969",
     });
 });
 
@@ -80,7 +83,7 @@ app.post("/connectServer", (req, res) => {
         "userId": playerId,
         "aceId": "test",
         "gateToken": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiYWRtaW4iOnRydWUsImlhdCI6MTUxNjIzOTAyMn0.KMUFsIDTnFmyG3nMiGM6H9FNFUROf3wh7SmqJp-QV30",
-        "endpoint": "204.12.195.98:6969",
+        "endpoint": "127.0.0.1:6969",
     });
 });
 
@@ -327,13 +330,53 @@ function BuildRegionList(){
   return RegionList;
 }
 
+// ---- MatchServer HTTP Client ----
+
+const http = require('http');
+
+function matchServerRequest(method, path, body) {
+  return new Promise((resolve, reject) => {
+    const url = new URL(path, MATCHSERVER_API);
+    const bodyStr = body ? JSON.stringify(body) : '';
+    const options = {
+      hostname: url.hostname,
+      port: url.port,
+      path: url.pathname,
+      method,
+      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(bodyStr) },
+      timeout: 5000,
+    };
+    const req = http.request(options, (res) => {
+      let data = '';
+      res.on('data', chunk => data += chunk);
+      res.on('end', () => {
+        try { resolve(JSON.parse(data)); }
+        catch(_) { resolve({ _raw: data }); }
+      });
+    });
+    req.on('error', (e) => reject(e));
+    req.on('timeout', () => { req.destroy(); reject(new Error('timeout')); });
+    if (bodyStr) req.write(bodyStr);
+    req.end();
+  });
+}
+
+// In-memory matchmaking ticket store (persists across connections)
+const matchTickets = new Map(); // ticketId → { userId, gameMode, regionIds, status, serverIp, serverPort, createdAt }
+
+function generateTicketId() {
+  return crypto.randomUUID().toString();
+}
+
+// ---- MatchServer Integration ----
+
 let fs = require("fs");
 
 const server = net.createServer((socket) => {
   console.log('\n=== Client connected ===');
   console.log(`From: ${socket.remoteAddress}:${socket.remotePort}\n`);
 
-  socket.on('data', (rawdata) => {
+  socket.on('data', async (rawdata) => {
     if(rawdata.length == 6 && rawdata.toString("hex") === "000000022f2f"){
       //console.log("[RECV] Keepalive");
 
@@ -376,7 +419,97 @@ const server = net.createServer((socket) => {
       else if(RPCPath === "/assets.Assets/UpdateRoleArchiveV2"){
         console.log("[RECV] Update Role Archive V2!");
 
-        // 解析请求 — UpdateRoleArchiveV2 的请求体结构与 GetPlayerArchiveV2 角色数据类似
+        // 解码 UpdateRoleArchiveV2Request: field1=Operation, field2=RoleId, field3=ItemId, field4=SkinData
+        let op = 1, roleId = '', itemId = '', skinData = null;
+        if (MessageBytes && MessageBytes.length > 0) {
+          try {
+            Root = protobuf.loadSync("./game/proto/Request/UpdateRoleArchiveV2Request.proto");
+            let ReqType = Root.lookupType("ProjectBoundary.UpdateRoleArchiveV2Request");
+            let req = ReqType.toObject(ReqType.decode(MessageBytes), ObjectOptions);
+            op = req.Operation ?? 1;
+            roleId = req.RoleId || '';
+            itemId = req.ItemId || '';
+            skinData = req.SkinData || null;
+          } catch(e) {
+            console.log("[ARCHIVE] Failed to decode UpdateRoleArchiveV2:", e.message);
+          }
+        }
+        if (skinData && skinData.length > 0) {
+          try {
+            // skinData is a Buffer from protobufjs decode
+            const SkinType = protobuf.loadSync("./game/proto/Request/UpdateRoleArchiveV2Request.proto")
+              .lookupType("ProjectBoundary.SkinPayload");
+            const skinObj = SkinType.toObject(SkinType.decode(skinData), ObjectOptions);
+            console.log(`[ARCHIVE] Update: op=${op} role=${roleId} item=${itemId} skinToken=${skinObj.TokenId || ''} ornament=${skinObj.OrnamentId || ''}`);
+          } catch(_) {
+            console.log(`[ARCHIVE] Update: op=${op} role=${roleId} item=${itemId} skinData=${skinData.length}b (raw)`);
+          }
+        } else {
+          console.log(`[ARCHIVE] Update: op=${op} role=${roleId} item=${itemId}`);
+        }
+
+        if (roleId) {
+          const store = getLoadoutStore();
+          const index = getDefinitionIndex();
+          const playerId = TEMP_USER_ID;
+          const data = store.load(playerId) || { playerId, roles: {} };
+          if (!data.roles[roleId]) data.roles[roleId] = {};
+          const role = data.roles[roleId];
+
+          // op → slot mapping (matches PlayerRoleData field numbers)
+          // 1=auto, 2=leftPylon, 3=rightPylon, 4=mobilityModule, 5=meleeWeapon, 6=primaryWeapon, 7=secondaryWeapon
+          const SLOT_MAP = {
+            2: 'leftPylon', 3: 'rightPylon', 4: 'mobilityModule',
+            5: 'meleeWeapon', 6: 'primaryWeapon', 7: 'secondaryWeapon',
+          };
+
+          if (itemId) {
+            // Equip
+            if (SLOT_MAP[op]) {
+              role[SLOT_MAP[op]] = itemId;
+            } else {
+              // op=1 or unknown: auto-detect slot by item type
+              const itemType = index.getItemType(itemId);
+              if (itemType === 'MeleeWeapon') role.meleeWeapon = itemId;
+              else if (itemType === 'MobilityModule') role.mobilityModule = itemId;
+              else if (itemType === 'PodWeapon') {
+                if (!role.leftPylon || role.leftPylon === 'None') role.leftPylon = itemId;
+                else role.rightPylon = itemId;
+              } else {
+                if (!role.primaryWeapon || role.primaryWeapon === 'None') role.primaryWeapon = itemId;
+                else role.secondaryWeapon = itemId;
+              }
+            }
+          } else if (skinData && skinData.length > 0) {
+            // Skin-only update (no item change)
+            try {
+              const SkinType = protobuf.loadSync("./game/proto/Request/UpdateRoleArchiveV2Request.proto")
+                .lookupType("ProjectBoundary.SkinPayload");
+              const skinObj = SkinType.toObject(SkinType.decode(skinData), ObjectOptions);
+              if (skinObj.TokenId) role._skinToken = skinObj.TokenId;
+              if (skinObj.OrnamentId) role._ornamentId = skinObj.OrnamentId;
+            } catch(_) {}
+          } else {
+            // Empty item = unequip
+            if (SLOT_MAP[op]) {
+              role[SLOT_MAP[op]] = 'None';
+            }
+          }
+          // Save skin data if present
+          if (skinData && skinData.length > 0) {
+            role._skinData = skinData.toString('hex');
+            try {
+              const SkinType = protobuf.loadSync("./game/proto/Request/UpdateRoleArchiveV2Request.proto")
+                .lookupType("ProjectBoundary.SkinPayload");
+              const skinObj = SkinType.toObject(SkinType.decode(skinData), ObjectOptions);
+              if (skinObj.TokenId) role._skinToken = skinObj.TokenId;
+              if (skinObj.OrnamentId) role._ornamentId = skinObj.OrnamentId;
+            } catch(_) {}
+          }
+          store.save(playerId, data);
+        }
+
+        // Response — UpdateRoleArchiveV2 的请求体结构与 GetPlayerArchiveV2 角色数据类似
         // 但这里我们不解析 protobuf 请求（协议未完全逆向），仅返回成功
         // 真实的 UpdateRoleArchiveV2 请求格式待进一步逆向
 
@@ -402,9 +535,19 @@ const server = net.createServer((socket) => {
         let PlayerArchiveV2RequestObj = PlayerArchiveV2RequestType.toObject(PlayerArchiveV2Request, ObjectOptions);
 
         const store = getLoadoutStore();
-        const playerId = TEMP_USER_ID;  // 目前使用固定用户 ID
+        const playerId = TEMP_USER_ID;
         const roleIds = PlayerArchiveV2RequestObj.RoleIDs || [];
         const playerRoleDatas = store.getRoleArchive(playerId, roleIds);
+        const fullData = store.load(playerId);
+        const roles = (fullData && fullData.roles) || {};
+
+        // Attach weapon archive and skin data
+        for (const roleData of playerRoleDatas) {
+          const savedRole = roles[roleData.RoleID] || {};
+          roleData.WeaponArchiveRaw = savedRole._weaponArchiveRaw || '';
+          roleData.SkinToken = savedRole._skinToken || '';
+          roleData.OrnamentId = savedRole._ornamentId || '';
+        }
 
         let ResponseObj = {PlayerRoleDatas: playerRoleDatas, PlayerLevel: 0};
         console.log("[ARCHIVE] Returning loadout data:", JSON.stringify(ResponseObj));
@@ -577,27 +720,120 @@ const server = net.createServer((socket) => {
       else if(RPCPath === "/matchmaking.Matchmaking/StartUnityMatchmaking"){
         console.log("[RECV] Start Matchmaking!");
 
-        //console.log(data.toString("hex"));
+        let userId = '';
+        let gameMode = 'Purge';
+        let regionIds = [];
+        try {
+          Root = protobuf.loadSync("./game/proto/Request/StartMatchmakingRequest.proto");
+          let ReqType = Root.lookupType("ProjectBoundary.StartMatchmakingRequest");
+          let req = ReqType.toObject(ReqType.decode(MessageBytes), ObjectOptions);
+          userId = req.Payload.MatchmakingRequestorUserId || TEMP_USER_ID;
+          gameMode = req.GameMode || 'Purge';
+          regionIds = (req.Payload.UnknownMessage || []).map(m => m.RegionId).filter(Boolean);
+        } catch(e) {
+          console.log("[MATCH] Failed to decode StartMatchmaking:", e.message);
+        }
 
-        Root = protobuf.loadSync("./game/proto/Request/StartMatchmakingRequest.proto");
-
-        let StartMatchmakingRequestType = Root.lookupType("ProjectBoundary.StartMatchmakingRequest");
-
-        let StartMatchmakingRequest = StartMatchmakingRequestType.decode(MessageBytes);
-
-        let StartMatchmakingRequestObj = StartMatchmakingRequestType.toObject(StartMatchmakingRequest, ObjectOptions);
-
-        const UserIdToMatchmake = StartMatchmakingRequestObj.Payload.MatchmakingRequestorUserId;
-
-        // should probably validate that someday
+        // Try MatchServer API; fall back to in-memory ticket
+        let ticketId = generateTicketId();
+        let matchFound = false;
+        try {
+          const result = await matchServerRequest('POST', '/matchmaking/enqueue', {
+            userId, regionIds, gameMode, ticketId,
+          });
+          ticketId = result.ticketId || ticketId;
+          matchFound = result.status === 'found';
+          if (matchFound) {
+            matchTickets.set(ticketId, {
+              userId, gameMode, regionIds,
+              status: 'found',
+              serverIp: result.serverIp,
+              serverPort: result.serverPort,
+              createdAt: Date.now(),
+            });
+          }
+          console.log(`[MATCH] MatchServer: ticket=${ticketId} status=${result.status}`);
+        } catch(_) {
+          // MatchServer unavailable — queue locally
+          matchTickets.set(ticketId, {
+            userId, gameMode, regionIds,
+            status: 'queued',
+            serverIp: null, serverPort: null,
+            createdAt: Date.now(),
+          });
+          console.log(`[MATCH] MatchServer unavailable, queued locally: ticket=${ticketId}`);
+        }
 
         Root = protobuf.loadSync("./game/proto/Response/StartMatchmakingResponse.proto");
+        let RespType = Root.lookupType("ProjectBoundary.StartMatchmakingResponse");
+        let Resp = RespType.create({StatusCode: 0});
+        let ResponseBytes = RespType.encode(Resp).finish();
+        socket.write(WrapMessageAndSerialize(MessageId, RPCPath, ResponseBytes));
+      }
+      else if(RPCPath === "/matchmaking.Matchmaking/QueryUnityMatchmaking"){
+        // Parse ticketId from request
+        let ticketId = '';
+        try {
+          Root = protobuf.loadSync("./game/proto/Response/matchmaking_ext.proto");
+          let ReqType = Root.lookupType("ProjectBoundary.QueryUnityMatchmakingReq");
+          let req = ReqType.toObject(ReqType.decode(MessageBytes), ObjectOptions);
+          ticketId = req.ticketId || '';
+        } catch(_) {}
 
-        let StartMatchmakingResponseType = Root.lookupType("ProjectBoundary.StartMatchmakingResponse");
+        let status = 'queued', serverIp = '', serverPort = 0;
+        if (ticketId && matchTickets.has(ticketId)) {
+          const ticket = matchTickets.get(ticketId);
+          status = ticket.status;
+          serverIp = ticket.serverIp || '';
+          serverPort = ticket.serverPort || 0;
+        }
 
-        let StartMatchmakingResponse = StartMatchmakingResponseType.create({StatusCode: 0});
+        // Poll MatchServer if available
+        if (ticketId && status === 'queued') {
+          try {
+            const result = await matchServerRequest('GET', `/matchmaking/status/${ticketId}`);
+            if (result.status === 'found') {
+              const ticket = matchTickets.get(ticketId);
+              if (ticket) {
+                ticket.status = 'found';
+                ticket.serverIp = result.serverIp;
+                ticket.serverPort = result.serverPort;
+              }
+              status = 'found';
+              serverIp = result.serverIp;
+              serverPort = result.serverPort;
+            }
+          } catch(_) {}
+        }
 
-        let ResponseBytes = StartMatchmakingResponseType.encode(StartMatchmakingResponse).finish();
+        // Return empty response (QueryUnityMatchmakingRes has no known fields)
+        Root = protobuf.loadSync("./game/proto/Response/matchmaking_ext.proto");
+        let RespType = Root.lookupType("ProjectBoundary.QueryUnityMatchmakingRes");
+        let Resp = RespType.create({});
+        let ResponseBytes = RespType.encode(Resp).finish();
+        socket.write(WrapMessageAndSerialize(MessageId, RPCPath, ResponseBytes));
+      }
+      else if(RPCPath === "/matchmaking.Matchmaking/StopUnityMatchmaking"){
+        let ticketId = '';
+        try {
+          Root = protobuf.loadSync("./game/proto/Response/matchmaking_ext.proto");
+          let ReqType = Root.lookupType("ProjectBoundary.StopUnityMatchmakingReq");
+          let req = ReqType.toObject(ReqType.decode(MessageBytes), ObjectOptions);
+          ticketId = req.ticketId || '';
+        } catch(_) {}
+
+        console.log(`[MATCH] Stop matchmaking: ticket=${ticketId}`);
+        if (ticketId) {
+          matchTickets.delete(ticketId);
+          try {
+            await matchServerRequest('POST', `/matchmaking/cancel/${ticketId}`);
+          } catch(_) {}
+        }
+
+        Root = protobuf.loadSync("./game/proto/Response/matchmaking_ext.proto");
+        let RespType = Root.lookupType("ProjectBoundary.StopUnityMatchmakingRes");
+        let Resp = RespType.create({});
+        let ResponseBytes = RespType.encode(Resp).finish();
         socket.write(WrapMessageAndSerialize(MessageId, RPCPath, ResponseBytes));
       }
       else if(RPCPath === "/playerdata.PlayerDataClient/GetDataStatisticsInfo"){
@@ -637,6 +873,92 @@ const server = net.createServer((socket) => {
 
         let ResponseBytes = QueryCurrencyResponseType.encode(QueryCurrencyResponse).finish();
 
+        socket.write(WrapMessageAndSerialize(MessageId, RPCPath, ResponseBytes));
+      }
+      else if(RPCPath === "/assets.Assets/UpdateWeaponArchiveV2"){
+        console.log(`[RECV] Update Weapon Archive V2! (${MessageBytes ? MessageBytes.length : 0} bytes)`);
+
+        // Parse roleId from the first string field
+        let weaponRoleId = '';
+        if (MessageBytes && MessageBytes.length > 0) {
+          try {
+            // field 1, wire type 2 (length-delimited), read length at pos 1
+            if (MessageBytes[0] === 0x0a) {
+              const len = MessageBytes[1];
+              if (len < 128) weaponRoleId = MessageBytes.subarray(2, 2 + len).toString('utf-8');
+            }
+          } catch(_) {}
+        }
+        console.log(`[WEAPON] role=${weaponRoleId || '?'}, raw ${MessageBytes ? MessageBytes.length : 0}b`);
+
+        if (weaponRoleId) {
+          const store = getLoadoutStore();
+          const playerId = TEMP_USER_ID;
+          const data = store.load(playerId) || { playerId, roles: {} };
+          if (!data.roles[weaponRoleId]) data.roles[weaponRoleId] = {};
+          data.roles[weaponRoleId]._weaponArchiveRaw = MessageBytes ? MessageBytes.toString('hex') : '';
+          store.save(playerId, data);
+        }
+
+        Root = protobuf.loadSync("./game/proto/Response/UpdateRoleArchiveV2.proto");
+        let RespType = Root.lookupType("ProjectBoundary.UpdateRoleArchiveV2Response");
+        let Resp = RespType.create({StatusCode: 0});
+        let ResponseBytes = RespType.encode(Resp).finish();
+
+        socket.write(WrapMessageAndSerialize(MessageId, RPCPath, ResponseBytes));
+      }
+      else if(RPCPath === "/mission.Mission/QueryProgress"){
+        Root = protobuf.loadSync("./game/proto/Response/mission.proto");
+
+        let QueryProgressRespType = Root.lookupType("ProjectBoundary.QueryProgressResp");
+
+        let QueryProgressResp = QueryProgressRespType.create({});
+
+        let ResponseBytes = QueryProgressRespType.encode(QueryProgressResp).finish();
+
+        socket.write(WrapMessageAndSerialize(MessageId, RPCPath, ResponseBytes));
+      }
+      else if(RPCPath === "/event.Event/QueryOperatingEvent"){
+        Root = protobuf.loadSync("./game/proto/Response/event.proto");
+
+        let QueryOperatingEventRespType = Root.lookupType("ProjectBoundary.QueryOperatingEventResp");
+
+        let QueryOperatingEventResp = QueryOperatingEventRespType.create({});
+
+        let ResponseBytes = QueryOperatingEventRespType.encode(QueryOperatingEventResp).finish();
+
+        socket.write(WrapMessageAndSerialize(MessageId, RPCPath, ResponseBytes));
+      }
+      else if(RPCPath === "/eventtracking.EventTracking/Record"){
+        Root = protobuf.loadSync("./game/proto/Response/eventtracking.proto");
+
+        let RecordRespType = Root.lookupType("ProjectBoundary.RecordResp");
+
+        let RecordResp = RecordRespType.create({});
+
+        let ResponseBytes = RecordRespType.encode(RecordResp).finish();
+
+        socket.write(WrapMessageAndSerialize(MessageId, RPCPath, ResponseBytes));
+      }
+      else if(RPCPath === "/mission.Mission/QueryLoginRecord"){
+        Root = protobuf.loadSync("./game/proto/Response/mission.proto");
+        let RespType = Root.lookupType("ProjectBoundary.QueryLoginRecordResp");
+        let Resp = RespType.create({});
+        let ResponseBytes = RespType.encode(Resp).finish();
+        socket.write(WrapMessageAndSerialize(MessageId, RPCPath, ResponseBytes));
+      }
+      else if(RPCPath === "/mission.Mission/QueryActivitiesInfo"){
+        Root = protobuf.loadSync("./game/proto/Response/mission.proto");
+        let RespType = Root.lookupType("ProjectBoundary.QuestActivitiesInfoResp");
+        let Resp = RespType.create({});
+        let ResponseBytes = RespType.encode(Resp).finish();
+        socket.write(WrapMessageAndSerialize(MessageId, RPCPath, ResponseBytes));
+      }
+      else if(RPCPath === "/mission.Mission/QueryUserEvents"){
+        Root = protobuf.loadSync("./game/proto/Response/mission.proto");
+        let RespType = Root.lookupType("ProjectBoundary.QueryUserEventsResp");
+        let Resp = RespType.create({});
+        let ResponseBytes = RespType.encode(Resp).finish();
         socket.write(WrapMessageAndSerialize(MessageId, RPCPath, ResponseBytes));
       }
       else{
@@ -722,8 +1044,8 @@ const matchmakingTCPServer = net.createServer((socket) => {
 app.listen(process.env.PORT || 8000, () => {
     console.log(`mrow :3 - ${process.env.PORT || 8000}`);
 
-    server.listen(6969, () => {
-      console.log(`miau >:3 - ${6969}`);
+    server.listen(6968, () => {
+      console.log(`miau >:3 - ${6968}`);
 
       matchmakingUDPServer.bind(9000);
 

@@ -10,6 +10,9 @@ message PlayerRoleData{
     string MeleeWeapon = 5;
     string PrimaryWeapon = 6;
     string SecondWeapon = 7;
+    optional string WeaponArchiveRaw = 8;  // hex-encoded weapon part config
+    optional string SkinToken = 9;         // character skin token ID
+    optional string OrnamentId = 10;       // weapon ornament ID
 }
 
 message GetPlayerArchiveV2Response{
