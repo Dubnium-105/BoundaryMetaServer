@@ -493,6 +493,10 @@ const server = net.createServer((socket) => {
             // Empty item = unequip
             if (SLOT_MAP[op]) {
               role[SLOT_MAP[op]] = 'None';
+            } else if (op === 1) {
+              // op=1 with empty item: unequip primary weapon so auto-detect
+              // can place the next equipped weapon into the primary slot
+              role.primaryWeapon = 'None';
             }
           }
           // Save skin data if present
