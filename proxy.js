@@ -95,10 +95,12 @@ const RPC_MAP = {
         resInner: 'GetPlayerArchiveV2Response',
     },
     '/assets.Assets/UpdateRoleArchiveV2': {
+        reqInner: 'UpdateRoleArchiveV2Request',
         resWrapper: 'ResponseWrapper',
         resInner: 'UpdateRoleArchiveV2Response',
     },
     '/assets.Assets/UpdateWeaponArchiveV2': {
+        reqInner: 'UpdateWeaponArchiveV2Request',
         resWrapper: 'ResponseWrapper',
         resInner: 'UpdateRoleArchiveV2Response',
     },

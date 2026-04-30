@@ -878,25 +878,46 @@ const server = net.createServer((socket) => {
       else if(RPCPath === "/assets.Assets/UpdateWeaponArchiveV2"){
         console.log(`[RECV] Update Weapon Archive V2! (${MessageBytes ? MessageBytes.length : 0} bytes)`);
 
-        // Parse roleId from the first string field
         let weaponRoleId = '';
+        let waParsed = null;
         if (MessageBytes && MessageBytes.length > 0) {
           try {
-            // field 1, wire type 2 (length-delimited), read length at pos 1
+            const WARoot = protobuf.loadSync("./game/proto/Request/UpdateWeaponArchiveV2Request.proto");
+            const WAReqType = WARoot.lookupType("ProjectBoundary.UpdateWeaponArchiveV2Request");
+            waParsed = WAReqType.toObject(WAReqType.decode(MessageBytes), ObjectOptions);
+            weaponRoleId = waParsed.RoleId || '';
+            if (waParsed.WeaponArchive) {
+              console.log(`[WEAPON] role=${weaponRoleId} weapon=${waParsed.WeaponArchive.WeaponId} slots=${(waParsed.WeaponArchive.Parts || []).length}`);
+            }
+          } catch(e) {
+            console.log(`[WEAPON] Failed to decode: ${e.message}`);
+            // Fallback: parse roleId from raw bytes
             if (MessageBytes[0] === 0x0a) {
               const len = MessageBytes[1];
               if (len < 128) weaponRoleId = MessageBytes.subarray(2, 2 + len).toString('utf-8');
             }
-          } catch(_) {}
+          }
         }
-        console.log(`[WEAPON] role=${weaponRoleId || '?'}, raw ${MessageBytes ? MessageBytes.length : 0}b`);
 
         if (weaponRoleId) {
           const store = getLoadoutStore();
           const playerId = TEMP_USER_ID;
           const data = store.load(playerId) || { playerId, roles: {} };
           if (!data.roles[weaponRoleId]) data.roles[weaponRoleId] = {};
+
+          // Store full message bytes as hex (matches what GetPlayerArchiveV2Response expects)
           data.roles[weaponRoleId]._weaponArchiveRaw = MessageBytes ? MessageBytes.toString('hex') : '';
+
+          // Extract skin/ornament from parsed WeaponArchiveV2
+          if (waParsed && waParsed.WeaponArchive && waParsed.WeaponArchive.Skin) {
+            const skin = waParsed.WeaponArchive.Skin;
+            if (skin.SkinInfo && skin.SkinInfo.Id) {
+              data.roles[weaponRoleId]._skinToken = skin.SkinInfo.Id;
+            }
+            if (skin.WeaponOrnament && skin.WeaponOrnament !== 'WO-NONE') {
+              data.roles[weaponRoleId]._ornamentId = skin.WeaponOrnament;
+            }
+          }
           store.save(playerId, data);
         }
 
