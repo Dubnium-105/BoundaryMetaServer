@@ -2,7 +2,7 @@ const express = require('express');
 const bodyParser = require('body-parser');
 const app = express();
 
-// ---- 物品定义索引 & 配装存储 ----
+// ---- Definition index and loadout storage ----
 const { getDefinitionIndex } = require('./game/definitionIndex');
 const { getLoadoutStore } = require('./game/loadoutStore');
 
@@ -10,7 +10,7 @@ app.use(bodyParser.json({ limit: '2mb' }));
 app.use(bodyParser.urlencoded({ extended: true }));
 
 app.use((req, res, next) => {
-    // 跳过对 /api/ 路径的完整 body 日志（配装 JSON 可能很大）
+    // Avoid logging full /api/ bodies because loadout JSON can be large.
     if (req.originalUrl.startsWith('/api/')) {
         console.log(`\n=== API REQUEST ===`);
         console.log(`Time: ${new Date().toISOString()}`);
@@ -45,61 +45,61 @@ app.post("/recordClientStatus", (req, res) => {
     res.status(200).json({}); 
 });
 
-app.post("//connectServer", (req, res) => {
+const TEMP_USER_ID = "76561198211631084";
+const LEGACY_GATE_TOKEN = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiYWRtaW4iOnRydWUsImlhdCI6MTUxNjIzOTAyMn0.KMUFsIDTnFmyG3nMiGM6H9FNFUROf3wh7SmqJp-QV30";
+const gateSessions = new Map([[LEGACY_GATE_TOKEN, TEMP_USER_ID]]);
+
+function normalizePlayerId(playerId) {
+    if (typeof playerId !== "string") return TEMP_USER_ID;
+    const trimmed = playerId.trim();
+    return trimmed || TEMP_USER_ID;
+}
+
+function issueGateToken(playerId) {
+    const normalizedPlayerId = normalizePlayerId(playerId);
+    const gateToken = `prb.${Buffer.from(normalizedPlayerId, "utf8").toString("base64url")}.${crypto.randomUUID()}`;
+    gateSessions.set(gateToken, normalizedPlayerId);
+    return { gateToken, playerId: normalizedPlayerId };
+}
+
+function handleConnectServer(req, res) {
     const loginToken = req.body.loginToken;
     const platform = req.body.platform;
-    const playerId = req.body.playerId;
     const version = req.body.version;
+    const { gateToken, playerId } = issueGateToken(req.body.playerId);
 
     console.log("Connection Request:", {
         platform,
         playerId,
-        version
+        version,
+        loginTokenPresent: Boolean(loginToken),
     });
 
     res.status(200).json({
         "error": 0,
         "userId": playerId,
         "aceId": "test",
-        "gateToken": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiYWRtaW4iOnRydWUsImlhdCI6MTUxNjIzOTAyMn0.KMUFsIDTnFmyG3nMiGM6H9FNFUROf3wh7SmqJp-QV30",
+        "gateToken": gateToken,
         "endpoint": "127.0.0.1:6969",
     });
-});
+}
 
-app.post("/connectServer", (req, res) => {
-    const loginToken = req.body.loginToken;
-    const platform = req.body.platform;
-    const playerId = req.body.playerId;
-    const version = req.body.version;
-
-    console.log("Connection Request:", {
-        platform,
-        playerId,
-        version
-    });
-
-    res.status(200).json({
-        "error": 0,
-        "userId": playerId,
-        "aceId": "test",
-        "gateToken": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiYWRtaW4iOnRydWUsImlhdCI6MTUxNjIzOTAyMn0.KMUFsIDTnFmyG3nMiGM6H9FNFUROf3wh7SmqJp-QV30",
-        "endpoint": "127.0.0.1:6969",
-    });
-});
+app.post("//connectServer", handleConnectServer);
+app.post("/connectServer", handleConnectServer);
 
 // =====================================================================
-//  REST API — 配装 & 物品定义服务（供 Payload / Browser 使用）
+//  REST API for loadouts and definitions, used by Payload / Browser.
 // =====================================================================
 
-// ---- 物品定义查询 ----
+// ---- Definition queries ----
 
-// GET /api/definitions/roles — 所有角色 ID 列表
+// GET /api/definitions/roles - all role IDs
 app.get("/api/definitions/roles", (req, res) => {
     const index = getDefinitionIndex();
     res.status(200).json({ roles: index.getAllRoleIds() });
 });
 
-// GET /api/definitions/roles/:roleId — 角色定义
+// GET /api/definitions/roles/:roleId - role definition
 app.get("/api/definitions/roles/:roleId", (req, res) => {
     const index = getDefinitionIndex();
     const role = index.getRole(req.params.roleId);
@@ -120,20 +120,20 @@ app.get("/api/definitions/roles/:roleId", (req, res) => {
     });
 });
 
-// GET /api/definitions/weapons — 所有武器 ID 列表
+// GET /api/definitions/weapons - all weapon IDs
 app.get("/api/definitions/weapons", (req, res) => {
     const index = getDefinitionIndex();
     res.status(200).json({ weapons: index.getAllWeaponIds() });
 });
 
-// GET /api/definitions/weapons/:weaponId — 武器定义
+// GET /api/definitions/weapons/:weaponId - weapon definition
 app.get("/api/definitions/weapons/:weaponId", (req, res) => {
     const index = getDefinitionIndex();
     const weapon = index.getWeapon(req.params.weaponId);
     if (!weapon) {
         return res.status(404).json({ error: "Weapon not found", weaponId: req.params.weaponId });
     }
-    // 将 Set 转 Array 用于 JSON 序列化
+    // Convert Set values to arrays for JSON serialization.
     const slotScopes = {};
     for (const [slotName, partSet] of Object.entries(weapon.slotScopes)) {
         slotScopes[slotName] = Array.from(partSet);
@@ -145,7 +145,7 @@ app.get("/api/definitions/weapons/:weaponId", (req, res) => {
     });
 });
 
-// GET /api/definitions/resolve-weapon/:roleId/:baseWeaponId — 武器重定向
+// GET /api/definitions/resolve-weapon/:roleId/:baseWeaponId - weapon redirect
 app.get("/api/definitions/resolve-weapon/:roleId/:baseWeaponId", (req, res) => {
     const index = getDefinitionIndex();
     const result = index.resolveRoleWeaponId(req.params.roleId, req.params.baseWeaponId);
@@ -157,7 +157,7 @@ app.get("/api/definitions/resolve-weapon/:roleId/:baseWeaponId", (req, res) => {
     });
 });
 
-// GET /api/definitions/items/:itemId/type — 物品类型
+// GET /api/definitions/items/:itemId/type - item type
 app.get("/api/definitions/items/:itemId/type", (req, res) => {
     const index = getDefinitionIndex();
     const itemType = index.getItemType(req.params.itemId);
@@ -168,9 +168,9 @@ app.get("/api/definitions/items/:itemId/type", (req, res) => {
     });
 });
 
-// ---- 配装数据查询 / 更新 ----
+// ---- Loadout queries / updates ----
 
-// GET /api/loadout/:playerId — 获取玩家完整配装
+// GET /api/loadout/:playerId - full player loadout
 app.get("/api/loadout/:playerId", (req, res) => {
     const store = getLoadoutStore();
     const data = store.getFullLoadout(req.params.playerId);
@@ -180,18 +180,22 @@ app.get("/api/loadout/:playerId", (req, res) => {
     res.status(200).json(data);
 });
 
-// PUT /api/loadout/:playerId — 更新玩家配装（Browser 调用）
+// PUT /api/loadout/:playerId - update a player's full loadout.
 app.put("/api/loadout/:playerId", (req, res) => {
     const store = getLoadoutStore();
     const index = getDefinitionIndex();
 
     if (!req.body || !req.body.roles || typeof req.body.roles !== "object") {
-        return res.status(400).json({ error: "Request body must contain a roles object" });
+        return res.status(400).json({ error: "Request body must contain a roles object or array" });
     }
 
-    // 可选：先校验
-    const validation = index.validateLoadout(req.body);
-    store.setFullLoadout(req.params.playerId, req.body);
+    const normalizedLoadout = store.normalizeFullLoadout(req.body);
+    const validationLoadout = {
+        ...normalizedLoadout,
+        roles: Object.values(normalizedLoadout.roles || {}),
+    };
+    const validation = index.validateLoadout(validationLoadout);
+    store.setFullLoadout(req.params.playerId, normalizedLoadout);
 
     res.status(200).json({
         playerId: req.params.playerId,
@@ -200,7 +204,7 @@ app.put("/api/loadout/:playerId", (req, res) => {
     });
 });
 
-// GET /api/loadout/:playerId/:roleId — 获取玩家单个角色配装快照
+// GET /api/loadout/:playerId/:roleId - single role loadout snapshot
 app.get("/api/loadout/:playerId/:roleId", (req, res) => {
     const store = getLoadoutStore();
     const snapshot = store.getRoleLoadoutSnapshot(req.params.playerId, req.params.roleId);
@@ -214,9 +218,9 @@ app.get("/api/loadout/:playerId/:roleId", (req, res) => {
     res.status(200).json(snapshot);
 });
 
-// ---- 配装修验 / 过滤 ----
+// ---- Loadout validation / filtering ----
 
-// POST /api/loadout/validate — 校验 loadout JSON
+// POST /api/loadout/validate - validate loadout JSON
 app.post("/api/loadout/validate", (req, res) => {
     const index = getDefinitionIndex();
     const loadout = req.body && req.body.loadout ? req.body.loadout : req.body;
@@ -224,7 +228,7 @@ app.post("/api/loadout/validate", (req, res) => {
     res.status(200).json(result);
 });
 
-// POST /api/loadout/filter — 返回滤除不兼容物品的 loadout
+// POST /api/loadout/filter - remove incompatible loadout items
 app.post("/api/loadout/filter", (req, res) => {
     const index = getDefinitionIndex();
     const loadout = req.body && req.body.loadout ? req.body.loadout : req.body;
@@ -236,7 +240,7 @@ app.post("/api/loadout/filter", (req, res) => {
     });
 });
 
-// ---- 健康检查 ----
+// ---- Health check ----
 app.get("/api/health", (req, res) => {
     const index = getDefinitionIndex();
     const store = getLoadoutStore();
@@ -314,8 +318,6 @@ const ALPHA_TEXT = "Welcome to the Project Rebound Alpha. Please be patient and 
 
 const PLAYLISTS_JSON = { "PVP": [{ "Name": "Playtest", "Title": [{ "en": "Playtest" }], "Description": [, { "en": "Playtest a very early version of Project Rebound" }], "SecondaryDescription": [{ "en": "Please report any bugs to @systemdev in the Boundary discord" }], "BigTitle": [{ "en": "Playtest" }], "BigDescription": [{ "en": "Playtest a very early version of Project Rebound" }], "PlotImage": [{ "zh": "Capture" }, { "en": "Capture" }], "LargePlotImage": [{ "zh": "Capture" }, { "en": "Capture" }], "GameModeList": ["Purge"], "bHasFilter": false, "bIsLive": true, "Priority": 1, "StartTime": 0, "StopTime": 0 }] };
 
-const TEMP_USER_ID = "76561198211631084"
-
 let PartyPresence = "InMatching";
 
 function BuildRegionList(){
@@ -362,7 +364,7 @@ function matchServerRequest(method, path, body) {
 }
 
 // In-memory matchmaking ticket store (persists across connections)
-const matchTickets = new Map(); // ticketId → { userId, gameMode, regionIds, status, serverIp, serverPort, createdAt }
+const matchTickets = new Map(); // ticketId -> { userId, gameMode, regionIds, status, serverIp, serverPort, createdAt }
 
 function generateTicketId() {
   return crypto.randomUUID().toString();
@@ -411,15 +413,15 @@ const server = net.createServer((socket) => {
       const RPCPath = RequestObj.RPCPath;
       const MessageBytes = RequestObj.Message;
 
-      if(RPCPath === "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiYWRtaW4iOnRydWUsImlhdCI6MTUxNjIzOTAyMn0.KMUFsIDTnFmyG3nMiGM6H9FNFUROf3wh7SmqJp-QV30"){
-        //console.log("[RECV] Handshake!");
-
+      if(gateSessions.has(RPCPath)){
+        socket.playerId = gateSessions.get(RPCPath);
+        console.log(`[SESSION] Bound protobuf socket to player ${socket.playerId}`);
         socket.write(data);
       }
       else if(RPCPath === "/assets.Assets/UpdateRoleArchiveV2"){
         console.log("[RECV] Update Role Archive V2!");
 
-        // 解码 UpdateRoleArchiveV2Request: field1=Operation, field2=RoleId, field3=ItemId, field4=SkinData
+        // Decode UpdateRoleArchiveV2Request: field1=Operation, field2=RoleId, field3=ItemId, field4=SkinData
         let op = 1, roleId = '', itemId = '', skinData = null;
         if (MessageBytes && MessageBytes.length > 0) {
           try {
@@ -451,12 +453,12 @@ const server = net.createServer((socket) => {
         if (roleId) {
           const store = getLoadoutStore();
           const index = getDefinitionIndex();
-          const playerId = TEMP_USER_ID;
+          const playerId = socket.playerId || TEMP_USER_ID;
           const data = store.load(playerId) || { playerId, roles: {} };
           if (!data.roles[roleId]) data.roles[roleId] = {};
           const role = data.roles[roleId];
 
-          // op → slot mapping (matches PlayerRoleData field numbers)
+          // op -> slot mapping (matches PlayerRoleData field numbers)
           // 1=auto, 2=leftPylon, 3=rightPylon, 4=mobilityModule, 5=meleeWeapon, 6=primaryWeapon, 7=secondaryWeapon
           const SLOT_MAP = {
             2: 'leftPylon', 3: 'rightPylon', 4: 'mobilityModule',
@@ -470,14 +472,16 @@ const server = net.createServer((socket) => {
             } else {
               // op=1 or unknown: auto-detect slot by item type
               const itemType = index.getItemType(itemId);
-              if (itemType === 'MeleeWeapon') role.meleeWeapon = itemId;
-              else if (itemType === 'MobilityModule') role.mobilityModule = itemId;
-              else if (itemType === 'PodWeapon') {
+              if (itemType === 'EPBItemType::MeleeWeapon') role.meleeWeapon = itemId;
+              else if (itemType === 'EPBItemType::Mobility') role.mobilityModule = itemId;
+              else if (itemType === 'EPBItemType::Pod') {
                 if (!role.leftPylon || role.leftPylon === 'None') role.leftPylon = itemId;
                 else role.rightPylon = itemId;
-              } else {
+              } else if (itemType === 'EPBItemType::Weapon') {
                 if (!role.primaryWeapon || role.primaryWeapon === 'None') role.primaryWeapon = itemId;
                 else role.secondaryWeapon = itemId;
+              } else {
+                console.log(`[ARCHIVE] Ignored auto-slot item ${itemId} with type ${itemType || 'Unknown'}`);
               }
             }
           } else if (skinData && skinData.length > 0) {
@@ -513,9 +517,7 @@ const server = net.createServer((socket) => {
           store.save(playerId, data);
         }
 
-        // Response — UpdateRoleArchiveV2 的请求体结构与 GetPlayerArchiveV2 角色数据类似
-        // 但这里我们不解析 protobuf 请求（协议未完全逆向），仅返回成功
-        // 真实的 UpdateRoleArchiveV2 请求格式待进一步逆向
+        // Return success; the request body is decoded above only for the fields we persist.
 
         Root = protobuf.loadSync("./game/proto/Response/UpdateRoleArchiveV2.proto");
 
@@ -539,7 +541,7 @@ const server = net.createServer((socket) => {
         let PlayerArchiveV2RequestObj = PlayerArchiveV2RequestType.toObject(PlayerArchiveV2Request, ObjectOptions);
 
         const store = getLoadoutStore();
-        const playerId = TEMP_USER_ID;
+        const playerId = socket.playerId || TEMP_USER_ID;
         const roleIds = PlayerArchiveV2RequestObj.RoleIDs || [];
         const playerRoleDatas = store.getRoleArchive(playerId, roleIds);
         const fullData = store.load(playerId);
@@ -758,7 +760,7 @@ const server = net.createServer((socket) => {
           }
           console.log(`[MATCH] MatchServer: ticket=${ticketId} status=${result.status}`);
         } catch(_) {
-          // MatchServer unavailable — queue locally
+          // MatchServer unavailable - queue locally
           matchTickets.set(ticketId, {
             userId, gameMode, regionIds,
             status: 'queued',
@@ -905,12 +907,23 @@ const server = net.createServer((socket) => {
 
         if (weaponRoleId) {
           const store = getLoadoutStore();
-          const playerId = TEMP_USER_ID;
+          const playerId = socket.playerId || TEMP_USER_ID;
           const data = store.load(playerId) || { playerId, roles: {} };
           if (!data.roles[weaponRoleId]) data.roles[weaponRoleId] = {};
 
-          // Store full message bytes as hex (matches what GetPlayerArchiveV2Response expects)
-          data.roles[weaponRoleId]._weaponArchiveRaw = MessageBytes ? MessageBytes.toString('hex') : '';
+          const role = data.roles[weaponRoleId];
+          const rawHex = MessageBytes ? MessageBytes.toString('hex') : '';
+          const archiveWeaponId = waParsed && waParsed.WeaponArchive && waParsed.WeaponArchive.WeaponId
+            ? waParsed.WeaponArchive.WeaponId
+            : '';
+          if (!role._weaponArchives || typeof role._weaponArchives !== 'object' || Array.isArray(role._weaponArchives)) {
+            role._weaponArchives = {};
+          }
+          if (archiveWeaponId) {
+            role._weaponArchives[archiveWeaponId] = rawHex;
+          }
+          // Backward-compatible field for old clients; the per-weapon map remains authoritative.
+          role._weaponArchiveRaw = rawHex;
 
           // Extract skin/ornament from parsed WeaponArchiveV2
           if (waParsed && waParsed.WeaponArchive && waParsed.WeaponArchive.Skin) {

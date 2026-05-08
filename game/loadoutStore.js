@@ -1,10 +1,9 @@
 // ======================================================
-//  loadoutStore.js — 玩家配装持久化存储
+//  loadoutStore.js - player loadout persistence
 // ======================================================
-//  管理玩家配装数据的读写，供 REST API 和原生 protobuf
-//  处理器（GetPlayerArchiveV2, UpdateRoleArchiveV2）使用。
+//  Shared by REST endpoints and protobuf handlers.
 //
-//  存储格式 (data/loadouts/{playerId}.json):
+//  Storage format (data/loadouts/{playerId}.json):
 //    {
 //      "playerId": "...",
 //      "updatedAt": "2026-04-28T...",
@@ -16,7 +15,7 @@
 //          "rightPylon": "None",
 //          "mobilityModule": "PEACE_FCM-BOOST",
 //          "meleeWeapon": "MELEE-KNIFE",
-//          "loadoutSnapshot": { ... }  // 完整 loadout JSON（可选，供 Payload 使用）
+//          "loadoutSnapshot": { ... }  // optional structured JSON for Payload
 //        }
 //      }
 //    }
@@ -28,14 +27,12 @@ const DATA_DIR = path.join(__dirname, "..", "data", "loadouts");
 
 class LoadoutStore {
     constructor() {
-        // 内存缓存：playerId → loadout data
         this.cache = new Map();
     }
 
-    // ---- 内部路径 ----
+    // ---- Internal paths ----
 
     _playerPath(playerId) {
-        // 安全化 playerId（防止路径穿越）
         const safeId = playerId.replace(/[^a-zA-Z0-9_-]/g, "_");
         return path.join(DATA_DIR, `${safeId}.json`);
     }
@@ -46,15 +43,13 @@ class LoadoutStore {
         }
     }
 
-    // ---- 加载 / 保存 ----
+    // ---- Load / save ----
 
     /**
-     * 从磁盘加载玩家配装（含内存缓存）
      * @param {string} playerId
-     * @returns {object|null} 配装数据，不存在则返回 null
+     * @returns {object|null}
      */
     load(playerId) {
-        // 先查缓存
         if (this.cache.has(playerId)) {
             return this.cache.get(playerId);
         }
@@ -76,9 +71,8 @@ class LoadoutStore {
     }
 
     /**
-     * 保存玩家配装到磁盘并更新缓存
      * @param {string} playerId
-     * @param {object} data — { roles: { roleId: { primaryWeapon, ... } } }
+     * @param {object} data
      */
     save(playerId, data) {
         this._ensureDir();
@@ -100,13 +94,41 @@ class LoadoutStore {
         }
     }
 
-    // ---- 原生 protobuf 格式 ----
+    toFlatItemId(value, fallback = "None") {
+        if (typeof value === "string") {
+            return value || fallback;
+        }
+        if (value && typeof value === "object" && !Array.isArray(value)) {
+            if (typeof value.id === "string" && value.id) return value.id;
+            if (typeof value.mobilityModuleId === "string" && value.mobilityModuleId) {
+                return value.mobilityModuleId;
+            }
+        }
+        return fallback;
+    }
+
+    toFlatStringId(value, fallback = null) {
+        if (typeof value !== "string") return fallback;
+        return value || "None";
+    }
+
+    copyArchiveMetadata(target, source) {
+        if (!source || typeof source !== "object") return;
+        if (source._weaponArchiveRaw) target._weaponArchiveRaw = source._weaponArchiveRaw;
+        if (source._weaponArchives && typeof source._weaponArchives === "object" && !Array.isArray(source._weaponArchives)) {
+            target._weaponArchives = { ...source._weaponArchives };
+        }
+        if (source._skinToken) target._skinToken = source._skinToken;
+        if (source._ornamentId) target._ornamentId = source._ornamentId;
+        if (source._skinData) target._skinData = source._skinData;
+    }
+
+    // ---- Native protobuf shape ----
 
     /**
-     * 返回 GetPlayerArchiveV2 所需格式的数据
      * @param {string} playerId
-     * @param {string[]} roleIds — 请求的角色 ID 列表
-     * @returns {object[]} PlayerRoleData 数组
+     * @param {string[]} roleIds
+     * @returns {object[]} PlayerRoleData array
      */
     getRoleArchive(playerId, roleIds) {
         const data = this.load(playerId);
@@ -116,21 +138,21 @@ class LoadoutStore {
             const roleData = roles[roleId] || {};
             return {
                 RoleID: roleId,
-                LeftPylon: roleData.leftPylon || "None",
-                RightPylon: roleData.rightPylon || "None",
-                MobilityModule: roleData.mobilityModule || "None",
-                MeleeWeapon: roleData.meleeWeapon || "None",
-                PrimaryWeapon: roleData.primaryWeapon || "None",
-                SecondWeapon: roleData.secondaryWeapon || "None",
+                LeftPylon: this.toFlatItemId(roleData.leftPylon),
+                RightPylon: this.toFlatItemId(roleData.rightPylon),
+                MobilityModule: this.toFlatItemId(roleData.mobilityModule),
+                MeleeWeapon: this.toFlatItemId(roleData.meleeWeapon),
+                PrimaryWeapon: this.toFlatItemId(roleData.primaryWeapon),
+                SecondWeapon: this.toFlatItemId(roleData.secondaryWeapon),
             };
         });
     }
 
     /**
-     * 更新单个角色配装（由 UpdateRoleArchiveV2 调用）
+     * Update a single role archive from UpdateRoleArchiveV2.
      * @param {string} playerId
      * @param {string} roleId
-     * @param {object} roleArchive — { PrimaryWeapon, SecondWeapon, LeftPylon, RightPylon, MobilityModule, MeleeWeapon }
+     * @param {object} roleArchive
      */
     updateRoleArchive(playerId, roleId, roleArchive) {
         const data = this.load(playerId) || { playerId, roles: {} };
@@ -148,10 +170,10 @@ class LoadoutStore {
         this.save(playerId, data);
     }
 
-    // ---- Loadout JSON 完整快照（供 Payload 使用） ----
+    // ---- Loadout JSON snapshots for Payload ----
 
     /**
-     * 获取指定角色的完整 loadout snapshot JSON
+     * Get a single role loadout snapshot.
      * @param {string} playerId
      * @param {string} roleId
      * @returns {object|null}
@@ -159,14 +181,18 @@ class LoadoutStore {
     getRoleLoadoutSnapshot(playerId, roleId) {
         const data = this.load(playerId);
         if (!data || !data.roles || !data.roles[roleId]) return null;
-        return data.roles[roleId].loadoutSnapshot || null;
+        const roleData = data.roles[roleId];
+        if (roleData.loadoutSnapshot) {
+            return this.withSnapshotMetadata(roleId, roleData.loadoutSnapshot, roleData);
+        }
+        return this.buildFlatRoleSnapshot(roleId, roleData);
     }
 
     /**
-     * 保存指定角色的完整 loadout snapshot JSON
+     * Save a single role loadout snapshot.
      * @param {string} playerId
      * @param {string} roleId
-     * @param {object} snapshot — 完整 loadout JSON（含 weaponConfigs, inventory 等）
+     * @param {object} snapshot
      */
     setRoleLoadoutSnapshot(playerId, roleId, snapshot) {
         const data = this.load(playerId) || { playerId, roles: {} };
@@ -176,33 +202,17 @@ class LoadoutStore {
         }
         data.roles[roleId].loadoutSnapshot = snapshot;
 
-        // 同时更新简化的原生格式字段
         if (snapshot) {
-            const wc = snapshot.weaponConfigs || {};
-            const weaponIds = Object.keys(wc);
-            data.roles[roleId].primaryWeapon = weaponIds[0] || "None";
-            data.roles[roleId].secondaryWeapon = weaponIds[1] || "None";
-            if (snapshot.leftLauncher && snapshot.leftLauncher.id) {
-                data.roles[roleId].leftPylon = snapshot.leftLauncher.id;
-            }
-            if (snapshot.rightLauncher && snapshot.rightLauncher.id) {
-                data.roles[roleId].rightPylon = snapshot.rightLauncher.id;
-            }
-            if (snapshot.mobilityModule && snapshot.mobilityModule.mobilityModuleId) {
-                data.roles[roleId].mobilityModule = snapshot.mobilityModule.mobilityModuleId;
-            }
-            if (snapshot.meleeWeapon && snapshot.meleeWeapon.id) {
-                data.roles[roleId].meleeWeapon = snapshot.meleeWeapon.id;
-            }
+            this.applySnapshotSummary(data.roles[roleId], snapshot);
         }
 
         this.save(playerId, data);
     }
 
     /**
-     * 获取玩家所有角色的完整 loadout
+     * Get all stored role loadouts for a player.
      * @param {string} playerId
-     * @returns {object|null} — { playerId, updatedAt, roles: { roleId: loadoutSnapshot } }
+     * @returns {object|null}
      */
     getFullLoadout(playerId) {
         const data = this.load(playerId);
@@ -215,42 +225,156 @@ class LoadoutStore {
         };
 
         for (const [roleId, roleData] of Object.entries(data.roles || {})) {
-            result.roles[roleId] = roleData.loadoutSnapshot || roleData;
+            result.roles[roleId] = roleData.loadoutSnapshot
+                ? this.withSnapshotMetadata(roleId, roleData.loadoutSnapshot, roleData)
+                : this.buildFlatRoleSnapshot(roleId, roleData);
         }
 
         return result;
     }
 
+    normalizeFullLoadout(fullLoadout) {
+        const normalized = { ...(fullLoadout || {}), roles: {} };
+        const roles = fullLoadout && fullLoadout.roles;
+
+        if (Array.isArray(roles)) {
+            for (const role of roles) {
+                if (!role || typeof role !== "object") continue;
+                const roleId = role.roleId || role.RoleID;
+                if (!roleId) continue;
+                normalized.roles[roleId] = { ...role, roleId };
+            }
+            return normalized;
+        }
+
+        if (roles && typeof roles === "object") {
+            for (const [roleId, role] of Object.entries(roles)) {
+                if (!role || typeof role !== "object") continue;
+                normalized.roles[roleId] = {
+                    ...role,
+                    roleId: role.roleId || role.RoleID || roleId,
+                };
+            }
+        }
+
+        return normalized;
+    }
+
+    isStructuredRoleSnapshot(snapshot) {
+        if (!snapshot || typeof snapshot !== "object") return false;
+        const isObject = (value) => Boolean(value && typeof value === "object" && !Array.isArray(value));
+        return Boolean(
+            isObject(snapshot.inventory) ||
+            isObject(snapshot.weaponConfigs) ||
+            isObject(snapshot.characterData) ||
+            isObject(snapshot.leftLauncher) ||
+            isObject(snapshot.rightLauncher) ||
+            isObject(snapshot.meleeWeapon) ||
+            isObject(snapshot.mobilityModule)
+        );
+    }
+
+    applyFlatRoleData(target, roleData) {
+        const copyIfPresent = (fromKey, toKey = fromKey) => {
+            if (Object.prototype.hasOwnProperty.call(roleData, fromKey)) {
+                const value = this.toFlatStringId(roleData[fromKey], null);
+                if (value !== null) target[toKey] = value;
+            }
+        };
+
+        copyIfPresent("primaryWeapon");
+        copyIfPresent("secondaryWeapon");
+        copyIfPresent("leftPylon");
+        copyIfPresent("leftPod", "leftPylon");
+        copyIfPresent("leftLauncher", "leftPylon");
+        copyIfPresent("rightPylon");
+        copyIfPresent("rightPod", "rightPylon");
+        copyIfPresent("rightLauncher", "rightPylon");
+        copyIfPresent("mobilityModule");
+        copyIfPresent("meleeWeapon");
+
+        this.copyArchiveMetadata(target, roleData);
+    }
+
+    applySnapshotSummary(target, snapshot) {
+        const wc = (snapshot && snapshot.weaponConfigs && typeof snapshot.weaponConfigs === "object")
+            ? snapshot.weaponConfigs
+            : {};
+        const weaponIds = Object.keys(wc);
+        target.primaryWeapon = weaponIds[0] || this.toFlatStringId(snapshot && snapshot.primaryWeapon, null) || target.primaryWeapon || "None";
+        target.secondaryWeapon = weaponIds[1] || this.toFlatStringId(snapshot && snapshot.secondaryWeapon, null) || target.secondaryWeapon || "None";
+
+        const leftPylon = this.toFlatItemId(snapshot && snapshot.leftLauncher, null)
+            || this.toFlatStringId(snapshot && snapshot.leftPylon, null)
+            || this.toFlatStringId(snapshot && snapshot.leftPod, null);
+        const rightPylon = this.toFlatItemId(snapshot && snapshot.rightLauncher, null)
+            || this.toFlatStringId(snapshot && snapshot.rightPylon, null)
+            || this.toFlatStringId(snapshot && snapshot.rightPod, null);
+        const mobilityModule = this.toFlatItemId(snapshot && snapshot.mobilityModule, null);
+        const meleeWeapon = this.toFlatItemId(snapshot && snapshot.meleeWeapon, null);
+
+        if (leftPylon !== null) target.leftPylon = leftPylon;
+        if (rightPylon !== null) target.rightPylon = rightPylon;
+        if (mobilityModule !== null) target.mobilityModule = mobilityModule;
+        if (meleeWeapon !== null) target.meleeWeapon = meleeWeapon;
+
+        this.copyArchiveMetadata(target, snapshot || {});
+    }
+
+    withSnapshotMetadata(roleId, snapshot, roleData) {
+        const result = { ...(snapshot || {}) };
+        if (!result.roleId && !result.RoleID) result.roleId = roleId;
+        this.copyArchiveMetadata(result, roleData);
+        return result;
+    }
+
+    buildFlatRoleSnapshot(roleId, roleData) {
+        const snapshot = {
+            roleId,
+            primaryWeapon: this.toFlatItemId(roleData.primaryWeapon),
+            secondaryWeapon: this.toFlatItemId(roleData.secondaryWeapon),
+            leftPylon: this.toFlatItemId(roleData.leftPylon),
+            rightPylon: this.toFlatItemId(roleData.rightPylon),
+            leftPod: this.toFlatItemId(roleData.leftPylon),
+            rightPod: this.toFlatItemId(roleData.rightPylon),
+            leftLauncher: this.toFlatItemId(roleData.leftPylon),
+            rightLauncher: this.toFlatItemId(roleData.rightPylon),
+            mobilityModule: this.toFlatItemId(roleData.mobilityModule),
+            meleeWeapon: this.toFlatItemId(roleData.meleeWeapon),
+            _weaponArchiveRaw: roleData._weaponArchiveRaw || "",
+            _weaponArchives: (roleData._weaponArchives && typeof roleData._weaponArchives === "object" && !Array.isArray(roleData._weaponArchives))
+                ? { ...roleData._weaponArchives }
+                : {},
+            _skinToken: roleData._skinToken || "",
+            _ornamentId: roleData._ornamentId || "",
+        };
+        if (roleData._skinData) snapshot._skinData = roleData._skinData;
+        return snapshot;
+    }
     /**
-     * 批量设置玩家配装（从 Browser 的完整 loadout snapshot）
+     * Replace or merge stored role loadouts for a player.
      * @param {string} playerId
-     * @param {object} fullLoadout — { roles: { roleId: loadoutSnapshot } }
+     * @param {object} fullLoadout
      */
     setFullLoadout(playerId, fullLoadout) {
         const data = this.load(playerId) || { playerId, roles: {} };
+        const normalized = this.normalizeFullLoadout(fullLoadout);
 
-        for (const [roleId, snapshot] of Object.entries(fullLoadout.roles || {})) {
+        for (const [roleId, snapshot] of Object.entries(normalized.roles || {})) {
             if (!data.roles[roleId]) {
                 data.roles[roleId] = {};
             }
-            data.roles[roleId].loadoutSnapshot = snapshot;
 
-            // 更新简化的原生格式字段
-            const wc = (snapshot && snapshot.weaponConfigs) || {};
-            const weaponIds = Object.keys(wc);
-            data.roles[roleId].primaryWeapon = weaponIds[0] || data.roles[roleId].primaryWeapon || "None";
-            data.roles[roleId].secondaryWeapon = weaponIds[1] || data.roles[roleId].secondaryWeapon || "None";
-            if (snapshot && snapshot.leftLauncher && snapshot.leftLauncher.id) {
-                data.roles[roleId].leftPylon = snapshot.leftLauncher.id;
-            }
-            if (snapshot && snapshot.rightLauncher && snapshot.rightLauncher.id) {
-                data.roles[roleId].rightPylon = snapshot.rightLauncher.id;
-            }
-            if (snapshot && snapshot.mobilityModule && snapshot.mobilityModule.mobilityModuleId) {
-                data.roles[roleId].mobilityModule = snapshot.mobilityModule.mobilityModuleId;
-            }
-            if (snapshot && snapshot.meleeWeapon && snapshot.meleeWeapon.id) {
-                data.roles[roleId].meleeWeapon = snapshot.meleeWeapon.id;
+            if (snapshot && snapshot.loadoutSnapshot && typeof snapshot.loadoutSnapshot === "object") {
+                data.roles[roleId].loadoutSnapshot = snapshot.loadoutSnapshot;
+                this.applySnapshotSummary(data.roles[roleId], snapshot.loadoutSnapshot);
+                this.copyArchiveMetadata(data.roles[roleId], snapshot);
+            } else if (this.isStructuredRoleSnapshot(snapshot)) {
+                data.roles[roleId].loadoutSnapshot = snapshot;
+                this.applySnapshotSummary(data.roles[roleId], snapshot);
+            } else {
+                delete data.roles[roleId].loadoutSnapshot;
+                this.applyFlatRoleData(data.roles[roleId], snapshot || {});
             }
         }
 
@@ -258,7 +382,7 @@ class LoadoutStore {
     }
 }
 
-// 单例
+// Singleton
 let instance = null;
 
 function getLoadoutStore() {
