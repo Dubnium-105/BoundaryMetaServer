@@ -157,43 +157,92 @@ class LoadoutStore {
         }
     }
 
-    decodeWeaponArchiveRaw(hex) {
+    toReadableWeaponArchive(archive = {}) {
+        const skin = archive.Skin || {};
+        const skinInfo = skin.SkinInfo || {};
+        return {
+            weaponId: archive.WeaponId || "",
+            parts: (archive.Parts || []).map((part) => {
+                const info = part.Ornament && part.Ornament.Info ? part.Ornament.Info : {};
+                return {
+                    slotId: part.SlotId || 0,
+                    partId: part.PartId || "",
+                    ornamentType: info.Type || "",
+                    ornamentId: info.Id || "",
+                };
+            }),
+            skin: {
+                type: skinInfo.Type || "",
+                id: skinInfo.Id || "",
+                weaponOrnament: skin.WeaponOrnament || "",
+            },
+        };
+    }
+
+    decodeWeaponArchiveEnvelope(hex) {
         if (!hex || typeof hex !== "string") return null;
         try {
-            const ArchiveType = protobuf.loadSync(WEAPON_ARCHIVE_PROTO)
-                .lookupType("ProjectBoundary.UpdateWeaponArchiveV2Request");
-            const decoded = ArchiveType.toObject(ArchiveType.decode(Buffer.from(hex, "hex")), {
-                longs: String,
-                enums: String,
-                bytes: Buffer,
-                defaults: true,
-                arrays: true,
-                objects: true,
-            });
-            const archive = decoded.WeaponArchive || {};
-            const skin = archive.Skin || {};
-            const skinInfo = skin.SkinInfo || {};
-            return {
-                roleId: decoded.RoleId || "",
-                weaponId: archive.WeaponId || "",
-                parts: (archive.Parts || []).map((part) => {
-                    const info = part.Ornament && part.Ornament.Info ? part.Ornament.Info : {};
-                    return {
-                        slotId: part.SlotId || 0,
-                        partId: part.PartId || "",
-                        ornamentType: info.Type || "",
-                        ornamentId: info.Id || "",
-                    };
-                }),
-                skin: {
-                    type: skinInfo.Type || "",
-                    id: skinInfo.Id || "",
-                    weaponOrnament: skin.WeaponOrnament || "",
-                },
-            };
+            const root = protobuf.loadSync(WEAPON_ARCHIVE_PROTO);
+            const WeaponArchiveType = root.lookupType("ProjectBoundary.WeaponArchiveV2");
+            const buffer = Buffer.from(hex, "hex");
+            const reader = protobuf.Reader.create(buffer);
+            const envelope = { roleId: "", archives: [] };
+
+            while (reader.pos < reader.len) {
+                const tag = reader.uint32();
+                const fieldNo = tag >>> 3;
+                const wireType = tag & 7;
+
+                if (fieldNo === 1 && wireType === 2) {
+                    envelope.roleId = reader.string();
+                } else if (fieldNo === 3 && wireType === 2) {
+                    const length = reader.uint32();
+                    const start = reader.pos;
+                    const end = start + length;
+                    const archiveBytes = Buffer.from(reader.buf.subarray(start, end));
+                    reader.pos = end;
+                    const archive = WeaponArchiveType.toObject(WeaponArchiveType.decode(archiveBytes), {
+                        longs: String,
+                        enums: String,
+                        bytes: Buffer,
+                        defaults: true,
+                        arrays: true,
+                        objects: true,
+                    });
+                    envelope.archives.push(archive);
+                } else {
+                    reader.skipType(wireType);
+                }
+            }
+
+            return envelope.archives.length > 0 ? envelope : null;
         } catch (_) {
             return null;
         }
+    }
+
+    decodeWeaponArchiveRaw(hex) {
+        const envelope = this.decodeWeaponArchiveEnvelope(hex);
+        if (!envelope) return null;
+
+        const readableArchives = envelope.archives.map((archive) => this.toReadableWeaponArchive(archive));
+        if (readableArchives.length === 1) {
+            return {
+                roleId: envelope.roleId || "",
+                ...readableArchives[0],
+            };
+        }
+
+        const byWeaponId = {};
+        for (const archive of readableArchives) {
+            if (archive.weaponId) byWeaponId[archive.weaponId] = archive;
+        }
+
+        return {
+            roleId: envelope.roleId || "",
+            weaponArchives: readableArchives,
+            weapons: byWeaponId,
+        };
     }
 
     attachDecodedMetadata(data) {
@@ -287,6 +336,57 @@ class LoadoutStore {
         }
     }
 
+    buildWeaponArchiveBundleRaw(roleId, weaponIds, roleData = {}) {
+        const uniqueWeaponIds = Array.from(new Set((weaponIds || [])
+            .map((weaponId) => this.toFlatItemId(weaponId, null))
+            .filter((weaponId) => !this.isNoneish(weaponId))));
+        if (this.isNoneish(roleId) || uniqueWeaponIds.length === 0) return "";
+
+        const root = protobuf.loadSync(WEAPON_ARCHIVE_PROTO);
+        const WeaponArchiveType = root.lookupType("ProjectBoundary.WeaponArchiveV2");
+        const archivesByWeapon = roleData._weaponArchives && typeof roleData._weaponArchives === "object" && !Array.isArray(roleData._weaponArchives)
+            ? roleData._weaponArchives
+            : {};
+        const legacyEnvelope = this.decodeWeaponArchiveEnvelope(roleData._weaponArchiveRaw);
+        const archiveObjects = [];
+
+        for (const weaponId of uniqueWeaponIds) {
+            let archive = null;
+
+            if (archivesByWeapon[weaponId]) {
+                const envelope = this.decodeWeaponArchiveEnvelope(archivesByWeapon[weaponId]);
+                archive = envelope && envelope.archives.find((candidate) => candidate.WeaponId === weaponId);
+            }
+
+            if (!archive && legacyEnvelope) {
+                archive = legacyEnvelope.archives.find((candidate) => candidate.WeaponId === weaponId);
+            }
+
+            if (!archive) {
+                const defaultEnvelope = this.decodeWeaponArchiveEnvelope(this.buildDefaultWeaponArchiveRaw(roleId, weaponId));
+                archive = defaultEnvelope && defaultEnvelope.archives.find((candidate) => candidate.WeaponId === weaponId);
+            }
+
+            if (archive) archiveObjects.push(archive);
+        }
+
+        if (archiveObjects.length === 0 && roleData._weaponArchiveRaw) {
+            return roleData._weaponArchiveRaw;
+        }
+
+        if (archiveObjects.length === 0) return "";
+
+        const writer = protobuf.Writer.create();
+        writer.uint32(10).string(roleId);
+        for (const archive of archiveObjects) {
+            writer.uint32(26).fork();
+            WeaponArchiveType.encode(WeaponArchiveType.fromObject(archive), writer);
+            writer.ldelim();
+        }
+
+        return Buffer.from(writer.finish()).toString("hex");
+    }
+
     copyArchiveMetadata(target, source) {
         if (!source || typeof source !== "object") return;
         if (source._weaponArchiveRaw) target._weaponArchiveRaw = source._weaponArchiveRaw;
@@ -310,6 +410,11 @@ class LoadoutStore {
         if (weaponId && archives[weaponId]) return archives[weaponId];
         if (Object.keys(archives).length === 0 && roleData._weaponArchiveRaw) return roleData._weaponArchiveRaw;
         return this.buildDefaultWeaponArchiveRaw(roleId, weaponId);
+    }
+
+    getWeaponArchiveRawBundleForRole(roleData, weaponIds = [], roleId = null) {
+        if (!roleData || typeof roleData !== "object") return "";
+        return this.buildWeaponArchiveBundleRaw(roleId, weaponIds, roleData);
     }
 
     getRoleDefinition(roleId) {

@@ -569,7 +569,12 @@ const server = net.createServer((socket) => {
         for (const roleData of playerRoleDatas) {
           const savedRole = roles[roleData.RoleID] || {};
           const defaultSkin = store.getDefaultRoleSkinMetadata(roleData.RoleID);
-          roleData.WeaponArchiveRaw = store.getWeaponArchiveRawForRole(savedRole, roleData.PrimaryWeapon, roleData.RoleID);
+          // Put primary last so singular field-3 decoders keep the legacy primary archive.
+          roleData.WeaponArchiveRaw = store.getWeaponArchiveRawBundleForRole(
+            savedRole,
+            [roleData.SecondWeapon, roleData.PrimaryWeapon],
+            roleData.RoleID
+          );
           roleData.SkinToken = savedRole._skinToken || defaultSkin.skinToken || '';
           roleData.OrnamentId = savedRole._ornamentId || defaultSkin.ornamentId || '';
           if (savedRole._skinData) {
