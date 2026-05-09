@@ -465,22 +465,10 @@ const server = net.createServer((socket) => {
             5: 'meleeWeapon', 6: 'primaryWeapon', 7: 'secondaryWeapon',
           };
           const setPrimaryWeapon = (nextWeapon) => {
-            const previousPrimary = role.primaryWeapon;
             role.primaryWeapon = nextWeapon;
-            if (role.secondaryWeapon === nextWeapon) {
-              role.secondaryWeapon = previousPrimary && previousPrimary !== nextWeapon
-                ? previousPrimary
-                : 'None';
-            }
           };
           const setSecondaryWeapon = (nextWeapon) => {
-            const previousSecondary = role.secondaryWeapon;
             role.secondaryWeapon = nextWeapon;
-            if (role.primaryWeapon === nextWeapon) {
-              role.primaryWeapon = previousSecondary && previousSecondary !== nextWeapon
-                ? previousSecondary
-                : 'None';
-            }
           };
 
           if (itemId) {
