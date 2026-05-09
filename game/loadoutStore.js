@@ -22,8 +22,15 @@
 
 const fs = require("fs");
 const path = require("path");
+const { getDefinitionIndex } = require("./definitionIndex");
 
 const DATA_DIR = path.join(__dirname, "..", "data", "loadouts");
+const ITEM_TYPE = {
+    Weapon: "EPBItemType::Weapon",
+    MeleeWeapon: "EPBItemType::MeleeWeapon",
+    Mobility: "EPBItemType::Mobility",
+    Pod: "EPBItemType::Pod",
+};
 
 class LoadoutStore {
     constructor() {
@@ -123,6 +130,128 @@ class LoadoutStore {
         if (source._skinData) target._skinData = source._skinData;
     }
 
+    getWeaponArchiveRawForRole(roleData, preferredWeaponId = null) {
+        if (!roleData || typeof roleData !== "object") return "";
+        const archives = roleData._weaponArchives && typeof roleData._weaponArchives === "object" && !Array.isArray(roleData._weaponArchives)
+            ? roleData._weaponArchives
+            : {};
+        const weaponId = this.toFlatItemId(preferredWeaponId || roleData.primaryWeapon, null);
+        if (weaponId && archives[weaponId]) return archives[weaponId];
+        return roleData._weaponArchiveRaw || "";
+    }
+
+    getRoleDefinition(roleId) {
+        const index = getDefinitionIndex();
+        if (index.getRole(roleId)) return { index, canonicalRoleId: roleId, role: index.getRole(roleId) };
+
+        const upperRoleId = typeof roleId === "string" ? roleId.toUpperCase() : roleId;
+        if (upperRoleId && index.getRole(upperRoleId)) {
+            return { index, canonicalRoleId: upperRoleId, role: index.getRole(upperRoleId) };
+        }
+
+        for (const knownRoleId of index.getAllRoleIds()) {
+            if (typeof roleId === "string" && knownRoleId.toLowerCase() === roleId.toLowerCase()) {
+                return { index, canonicalRoleId: knownRoleId, role: index.getRole(knownRoleId) };
+            }
+        }
+
+        return { index, canonicalRoleId: roleId, role: null };
+    }
+
+    firstFromSet(set, offset = 0) {
+        if (!set || typeof set[Symbol.iterator] !== "function") return "None";
+        const values = Array.from(set).filter(Boolean);
+        return values[offset] || "None";
+    }
+
+    buildDefaultRoleData(roleId) {
+        const { role } = this.getRoleDefinition(roleId);
+        if (!role) return {};
+
+        return {
+            primaryWeapon: this.firstFromSet(role.weaponScope, 0),
+            secondaryWeapon: this.firstFromSet(role.weaponScope, 1),
+            leftPylon: this.firstFromSet(role.podScope, 0),
+            rightPylon: this.firstFromSet(role.podScope, 1),
+            mobilityModule: this.firstFromSet(role.mobilityScope, 0),
+            meleeWeapon: this.firstFromSet(role.meleeWeaponScope, 0),
+        };
+    }
+
+    isNoneish(value) {
+        return !value || value === "None";
+    }
+
+    isAllowedForSlot(role, slot, itemId) {
+        if (!role || this.isNoneish(itemId)) return false;
+        if (slot === "primaryWeapon" || slot === "secondaryWeapon") return role.weaponScope.has(itemId);
+        if (slot === "leftPylon" || slot === "rightPylon") return role.podScope.has(itemId);
+        if (slot === "mobilityModule") return role.mobilityScope.has(itemId);
+        if (slot === "meleeWeapon") return role.meleeWeaponScope.has(itemId);
+        return false;
+    }
+
+    placeItemByType(target, role, index, itemId, preferredSlot = null) {
+        if (this.isNoneish(itemId)) return false;
+        const itemType = index.getItemType(itemId);
+
+        if (itemType === ITEM_TYPE.Weapon && role.weaponScope.has(itemId)) {
+            if (preferredSlot === "secondaryWeapon") target.secondaryWeapon = itemId;
+            else if (preferredSlot === "primaryWeapon") target.primaryWeapon = itemId;
+            else if (this.isNoneish(target.primaryWeapon)) target.primaryWeapon = itemId;
+            else target.secondaryWeapon = itemId;
+            return true;
+        }
+
+        if (itemType === ITEM_TYPE.Pod && role.podScope.has(itemId)) {
+            if (preferredSlot === "rightPylon") target.rightPylon = itemId;
+            else if (preferredSlot === "leftPylon") target.leftPylon = itemId;
+            else if (this.isNoneish(target.leftPylon)) target.leftPylon = itemId;
+            else target.rightPylon = itemId;
+            return true;
+        }
+
+        if (itemType === ITEM_TYPE.Mobility && role.mobilityScope.has(itemId)) {
+            target.mobilityModule = itemId;
+            return true;
+        }
+
+        if (itemType === ITEM_TYPE.MeleeWeapon && role.meleeWeaponScope.has(itemId)) {
+            target.meleeWeapon = itemId;
+            return true;
+        }
+
+        return false;
+    }
+
+    getNormalizedRoleData(roleId, roleData = {}) {
+        const { index, role } = this.getRoleDefinition(roleId);
+        if (!role) return { ...(roleData || {}) };
+
+        const normalized = this.buildDefaultRoleData(roleId);
+        const slotKeys = [
+            "primaryWeapon",
+            "secondaryWeapon",
+            "leftPylon",
+            "rightPylon",
+            "mobilityModule",
+            "meleeWeapon",
+        ];
+
+        for (const slot of slotKeys) {
+            const itemId = this.toFlatItemId(roleData[slot], null);
+            if (this.isNoneish(itemId)) continue;
+            if (this.isAllowedForSlot(role, slot, itemId)) {
+                normalized[slot] = itemId;
+            } else {
+                this.placeItemByType(normalized, role, index, itemId, slot);
+            }
+        }
+
+        this.copyArchiveMetadata(normalized, roleData);
+        return normalized;
+    }
+
     // ---- Native protobuf shape ----
 
     /**
@@ -135,7 +264,7 @@ class LoadoutStore {
         const roles = (data && data.roles) || {};
 
         return roleIds.map((roleId) => {
-            const roleData = roles[roleId] || {};
+            const roleData = this.getNormalizedRoleData(roleId, roles[roleId] || {});
             return {
                 RoleID: roleId,
                 LeftPylon: this.toFlatItemId(roleData.leftPylon),
@@ -180,12 +309,12 @@ class LoadoutStore {
      */
     getRoleLoadoutSnapshot(playerId, roleId) {
         const data = this.load(playerId);
-        if (!data || !data.roles || !data.roles[roleId]) return null;
-        const roleData = data.roles[roleId];
-        if (roleData.loadoutSnapshot) {
+        const roleData = data && data.roles ? data.roles[roleId] : null;
+        if (!roleData && !this.getRoleDefinition(roleId).role) return null;
+        if (roleData && roleData.loadoutSnapshot) {
             return this.withSnapshotMetadata(roleId, roleData.loadoutSnapshot, roleData);
         }
-        return this.buildFlatRoleSnapshot(roleId, roleData);
+        return this.buildFlatRoleSnapshot(roleId, this.getNormalizedRoleData(roleId, roleData || {}));
     }
 
     /**
@@ -225,9 +354,10 @@ class LoadoutStore {
         };
 
         for (const [roleId, roleData] of Object.entries(data.roles || {})) {
+            const normalizedRoleData = this.getNormalizedRoleData(roleId, roleData);
             result.roles[roleId] = roleData.loadoutSnapshot
-                ? this.withSnapshotMetadata(roleId, roleData.loadoutSnapshot, roleData)
-                : this.buildFlatRoleSnapshot(roleId, roleData);
+                ? this.withSnapshotMetadata(roleId, roleData.loadoutSnapshot, normalizedRoleData)
+                : this.buildFlatRoleSnapshot(roleId, normalizedRoleData);
         }
 
         return result;
@@ -325,14 +455,18 @@ class LoadoutStore {
         const result = { ...(snapshot || {}) };
         if (!result.roleId && !result.RoleID) result.roleId = roleId;
         this.copyArchiveMetadata(result, roleData);
+        const preferredWeaponId = result.primaryWeapon || result.PrimaryWeapon || result.weaponId || null;
+        result._weaponArchiveRaw = this.getWeaponArchiveRawForRole(roleData, preferredWeaponId);
         return result;
     }
 
     buildFlatRoleSnapshot(roleId, roleData) {
+        const primaryWeapon = this.toFlatItemId(roleData.primaryWeapon);
+        const secondaryWeapon = this.toFlatItemId(roleData.secondaryWeapon);
         const snapshot = {
             roleId,
-            primaryWeapon: this.toFlatItemId(roleData.primaryWeapon),
-            secondaryWeapon: this.toFlatItemId(roleData.secondaryWeapon),
+            primaryWeapon,
+            secondaryWeapon,
             leftPylon: this.toFlatItemId(roleData.leftPylon),
             rightPylon: this.toFlatItemId(roleData.rightPylon),
             leftPod: this.toFlatItemId(roleData.leftPylon),
@@ -341,7 +475,7 @@ class LoadoutStore {
             rightLauncher: this.toFlatItemId(roleData.rightPylon),
             mobilityModule: this.toFlatItemId(roleData.mobilityModule),
             meleeWeapon: this.toFlatItemId(roleData.meleeWeapon),
-            _weaponArchiveRaw: roleData._weaponArchiveRaw || "",
+            _weaponArchiveRaw: this.getWeaponArchiveRawForRole(roleData, primaryWeapon),
             _weaponArchives: (roleData._weaponArchives && typeof roleData._weaponArchives === "object" && !Array.isArray(roleData._weaponArchives))
                 ? { ...roleData._weaponArchives }
                 : {},

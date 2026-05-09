@@ -458,31 +458,50 @@ const server = net.createServer((socket) => {
           if (!data.roles[roleId]) data.roles[roleId] = {};
           const role = data.roles[roleId];
 
-          // op -> slot mapping (matches PlayerRoleData field numbers)
-          // 1=auto, 2=leftPylon, 3=rightPylon, 4=mobilityModule, 5=meleeWeapon, 6=primaryWeapon, 7=secondaryWeapon
+          // Operation is not a pure slot index in captured traffic. Route by item
+          // type first, then use observed ops only to choose between sibling slots.
           const SLOT_MAP = {
             2: 'leftPylon', 3: 'rightPylon', 4: 'mobilityModule',
             5: 'meleeWeapon', 6: 'primaryWeapon', 7: 'secondaryWeapon',
           };
+          const setPrimaryWeapon = (nextWeapon) => {
+            const previousPrimary = role.primaryWeapon;
+            role.primaryWeapon = nextWeapon;
+            if (role.secondaryWeapon === nextWeapon) {
+              role.secondaryWeapon = previousPrimary && previousPrimary !== nextWeapon
+                ? previousPrimary
+                : 'None';
+            }
+          };
+          const setSecondaryWeapon = (nextWeapon) => {
+            const previousSecondary = role.secondaryWeapon;
+            role.secondaryWeapon = nextWeapon;
+            if (role.primaryWeapon === nextWeapon) {
+              role.primaryWeapon = previousSecondary && previousSecondary !== nextWeapon
+                ? previousSecondary
+                : 'None';
+            }
+          };
 
           if (itemId) {
-            // Equip
-            if (SLOT_MAP[op]) {
-              role[SLOT_MAP[op]] = itemId;
+            const itemType = index.getItemType(itemId);
+            const roleDef = index.getRole(roleId) || index.getRole(String(roleId).toUpperCase());
+            const allowed = (scope) => !roleDef || (roleDef[scope] && roleDef[scope].has(itemId));
+
+            if (itemType === 'EPBItemType::Weapon' && allowed('weaponScope')) {
+              if (op === 7) setSecondaryWeapon(itemId);
+              else setPrimaryWeapon(itemId);
+            } else if (itemType === 'EPBItemType::Pod' && allowed('podScope')) {
+              if (op === 3 || op === 7) role.rightPylon = itemId;
+              else if (op === 2 || op === 6 || op === 1) role.leftPylon = itemId;
+              else if (!role.leftPylon || role.leftPylon === 'None') role.leftPylon = itemId;
+              else role.rightPylon = itemId;
+            } else if (itemType === 'EPBItemType::Mobility' && allowed('mobilityScope')) {
+              role.mobilityModule = itemId;
+            } else if (itemType === 'EPBItemType::MeleeWeapon' && allowed('meleeWeaponScope')) {
+              role.meleeWeapon = itemId;
             } else {
-              // op=1 or unknown: auto-detect slot by item type
-              const itemType = index.getItemType(itemId);
-              if (itemType === 'EPBItemType::MeleeWeapon') role.meleeWeapon = itemId;
-              else if (itemType === 'EPBItemType::Mobility') role.mobilityModule = itemId;
-              else if (itemType === 'EPBItemType::Pod') {
-                if (!role.leftPylon || role.leftPylon === 'None') role.leftPylon = itemId;
-                else role.rightPylon = itemId;
-              } else if (itemType === 'EPBItemType::Weapon') {
-                if (!role.primaryWeapon || role.primaryWeapon === 'None') role.primaryWeapon = itemId;
-                else role.secondaryWeapon = itemId;
-              } else {
-                console.log(`[ARCHIVE] Ignored auto-slot item ${itemId} with type ${itemType || 'Unknown'}`);
-              }
+              console.log(`[ARCHIVE] Ignored slot update role=${roleId} op=${op} item=${itemId} type=${itemType || 'Unknown'}`);
             }
           } else if (skinData && skinData.length > 0) {
             // Skin-only update (no item change)
@@ -550,7 +569,10 @@ const server = net.createServer((socket) => {
         // Attach weapon archive and skin data
         for (const roleData of playerRoleDatas) {
           const savedRole = roles[roleData.RoleID] || {};
-          roleData.WeaponArchiveRaw = savedRole._weaponArchiveRaw || '';
+          const weaponArchives = savedRole._weaponArchives && typeof savedRole._weaponArchives === 'object' && !Array.isArray(savedRole._weaponArchives)
+            ? savedRole._weaponArchives
+            : {};
+          roleData.WeaponArchiveRaw = weaponArchives[roleData.PrimaryWeapon] || savedRole._weaponArchiveRaw || '';
           roleData.SkinToken = savedRole._skinToken || '';
           roleData.OrnamentId = savedRole._ornamentId || '';
         }
