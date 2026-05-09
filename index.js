@@ -470,6 +470,16 @@ const server = net.createServer((socket) => {
           const setSecondaryWeapon = (nextWeapon) => {
             role.secondaryWeapon = nextWeapon;
           };
+          const ensureWeaponArchive = (weaponId) => {
+            if (!weaponId || weaponId === 'None') return;
+            if (!role._weaponArchives || typeof role._weaponArchives !== 'object' || Array.isArray(role._weaponArchives)) {
+              role._weaponArchives = {};
+            }
+            if (!role._weaponArchives[weaponId]) {
+              const defaultRaw = store.buildDefaultWeaponArchiveRaw(roleId, weaponId);
+              if (defaultRaw) role._weaponArchives[weaponId] = defaultRaw;
+            }
+          };
 
           if (itemId) {
             const itemType = index.getItemType(itemId);
@@ -477,11 +487,12 @@ const server = net.createServer((socket) => {
             const allowed = (scope) => !roleDef || (roleDef[scope] && roleDef[scope].has(itemId));
 
             if (itemType === 'EPBItemType::Weapon' && allowed('weaponScope')) {
-              if (op === 7) setSecondaryWeapon(itemId);
+              if (op === 2 || op === 7) setSecondaryWeapon(itemId);
               else setPrimaryWeapon(itemId);
+              ensureWeaponArchive(itemId);
             } else if (itemType === 'EPBItemType::Pod' && allowed('podScope')) {
-              if (op === 3 || op === 7) role.rightPylon = itemId;
-              else if (op === 2 || op === 6 || op === 1) role.leftPylon = itemId;
+              if (op === 6 || op === 3 || op === 7) role.rightPylon = itemId;
+              else if (op === 5 || op === 2 || op === 1) role.leftPylon = itemId;
               else if (!role.leftPylon || role.leftPylon === 'None') role.leftPylon = itemId;
               else role.rightPylon = itemId;
             } else if (itemType === 'EPBItemType::Mobility' && allowed('mobilityScope')) {
@@ -557,12 +568,19 @@ const server = net.createServer((socket) => {
         // Attach weapon archive and skin data
         for (const roleData of playerRoleDatas) {
           const savedRole = roles[roleData.RoleID] || {};
-          const weaponArchives = savedRole._weaponArchives && typeof savedRole._weaponArchives === 'object' && !Array.isArray(savedRole._weaponArchives)
-            ? savedRole._weaponArchives
-            : {};
-          roleData.WeaponArchiveRaw = weaponArchives[roleData.PrimaryWeapon] || savedRole._weaponArchiveRaw || '';
-          roleData.SkinToken = savedRole._skinToken || '';
-          roleData.OrnamentId = savedRole._ornamentId || '';
+          const defaultSkin = store.getDefaultRoleSkinMetadata(roleData.RoleID);
+          roleData.WeaponArchiveRaw = store.getWeaponArchiveRawForRole(savedRole, roleData.PrimaryWeapon, roleData.RoleID);
+          roleData.SkinToken = savedRole._skinToken || defaultSkin.skinToken || '';
+          roleData.OrnamentId = savedRole._ornamentId || defaultSkin.ornamentId || '';
+          if (savedRole._skinData) {
+            try {
+              const SkinType = protobuf.loadSync("./game/proto/Request/UpdateRoleArchiveV2Request.proto")
+                .lookupType("ProjectBoundary.SkinPayload");
+              const skinObj = SkinType.toObject(SkinType.decode(Buffer.from(savedRole._skinData, 'hex')), ObjectOptions);
+              roleData.SkinToken = skinObj.TokenId || roleData.SkinToken;
+              roleData.OrnamentId = skinObj.OrnamentId || roleData.OrnamentId;
+            } catch(_) {}
+          }
         }
 
         let ResponseObj = {PlayerRoleDatas: playerRoleDatas, PlayerLevel: 0};
@@ -935,16 +953,8 @@ const server = net.createServer((socket) => {
           // Backward-compatible field for old clients; the per-weapon map remains authoritative.
           role._weaponArchiveRaw = rawHex;
 
-          // Extract skin/ornament from parsed WeaponArchiveV2
-          if (waParsed && waParsed.WeaponArchive && waParsed.WeaponArchive.Skin) {
-            const skin = waParsed.WeaponArchive.Skin;
-            if (skin.SkinInfo && skin.SkinInfo.Id) {
-              data.roles[weaponRoleId]._skinToken = skin.SkinInfo.Id;
-            }
-            if (skin.WeaponOrnament && skin.WeaponOrnament !== 'WO-NONE') {
-              data.roles[weaponRoleId]._ornamentId = skin.WeaponOrnament;
-            }
-          }
+          // Weapon skin/ornament are part of the per-weapon raw archive. Do not
+          // copy them into role skin fields used by PlayerRoleData.
           store.save(playerId, data);
         }
 
